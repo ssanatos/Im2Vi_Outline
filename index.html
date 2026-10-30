@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>네온 스케치 영상 만들기</title>
+<style>
+:root{color-scheme:dark;--ink:#07070f;--panel:#12121f;--line:#26263a;--tx:#ececf8;--dim:#8d8da8;--pink:#ff2e93;--cyan:#00f0ff;--lime:#b6ff3b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ink);color:var(--tx);font:16px/1.6 system-ui,-apple-system,"Apple SD Gothic Neo","Noto Sans KR",sans-serif}
+main{max-width:760px;margin:0 auto;padding:32px 18px 64px}
+h1{font-size:clamp(28px,7vw,44px);line-height:1.15;margin:0 0 8px;letter-spacing:-.02em;background:linear-gradient(90deg,var(--pink),var(--cyan),var(--lime));-webkit-background-clip:text;background-clip:text;color:transparent}
+.sub{color:var(--dim);margin:0 0 24px}
+.drop{display:block;border:2px dashed var(--line);border-radius:14px;padding:30px 16px;text-align:center;cursor:pointer;color:var(--dim);transition:border-color .15s,color .15s}
+.drop:hover,.drop.on{border-color:var(--cyan);color:var(--tx)}
+.drop input{display:none}
+.ctl{display:grid;gap:14px;margin:18px 0}
+.ctl label{display:grid;grid-template-columns:90px 1fr 44px;align-items:center;gap:10px;color:var(--dim);font-size:14px}
+.ctl output{color:var(--tx);text-align:right}
+input[type=range]{width:100%;accent-color:var(--pink)}
+button{font:inherit;border:0;border-radius:10px;padding:11px 16px;cursor:pointer;color:#06060c;background:var(--cyan);font-weight:700}
+button:hover:not(:disabled){filter:brightness(1.12)}
+button:focus-visible,.drop:focus-within{outline:2px solid var(--lime);outline-offset:2px}
+button:disabled{opacity:.5;cursor:wait}
+button.go{width:100%;background:linear-gradient(90deg,var(--pink),var(--cyan));font-size:17px}
+button.ghost{background:var(--panel);color:var(--tx);border:1px solid var(--line)}
+#status{min-height:24px;margin:14px 0;color:var(--lime);font-size:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px;margin-bottom:18px}
+.card canvas{width:100%;height:auto;display:block;border-radius:8px;background:#000}
+.row{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.row button{flex:1 1 130px}
+.note{color:var(--dim);font-size:13px;margin-top:28px}
+</style>
+</head>
+<body>
+<main>
+<h1>네온 스케치 영상</h1>
+<p class="sub">사진을 올리면 외곽선을 따서, 네온 라인이 스케치하듯 그려지는 영상으로 만들어요.</p>
+
+<label class="drop" id="dz">
+  <input type="file" id="files" accept="image/*" multiple>
+  <span id="fileLabel">이미지를 선택하거나 여기로 끌어다 놓기 (여러 장 가능)</span>
+</label>
+
+<div class="ctl">
+  <label>디테일 <input type="range" id="detail" min="0" max="100" value="45"><output id="detailO">45</output></label>
+  <label>그리는 시간 <input type="range" id="dur" min="3" max="20" value="7"><output id="durO">7초</output></label>
+</div>
+<button class="go" id="go">스케치 만들기</button>
+<div id="status" role="status"></div>
+<div id="results"></div>
+
+<p class="note">모든 처리는 브라우저 안에서만 이루어지고 이미지는 서버로 올라가지 않아요. 영상 저장은 그리는 시간만큼 걸리고, 저장 중에는 이 탭을 열어 두세요. 브라우저가 MP4 녹화를 지원하지 않으면 WebM으로 저장돼요.</p>
+</main>
+
+<script type="module">
+const $ = s => document.querySelector(s);
+const MAXP = 960, HOLD = 1.2, even = n => Math.max(2, Math.round(n / 2) * 2);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/* ---------- Canny ---------- */
+function gauss(src, w, h) {
+  const k = []; let s = 0;
+  for (let i = -2; i <= 2; i++) { const v = Math.exp(-i * i / (2 * 1.4 * 1.4)); k.push(v); s += v; }
+  for (let i = 0; i < 5; i++) k[i] /= s;
+  const t = new Float32Array(w * h), o = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let a = 0; for (let i = -2; i <= 2; i++) a += src[y * w + Math.min(w - 1, Math.max(0, x + i))] * k[i + 2];
+    t[y * w + x] = a;
+  }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let a = 0; for (let i = -2; i <= 2; i++) a += t[Math.min(h - 1, Math.max(0, y + i)) * w + x] * k[i + 2];
+    o[y * w + x] = a;
+  }
+  return o;
+}
+
+function canny(gray, w, h, detail) {
+  const b = gauss(gray, w, h), mag = new Float32Array(w * h), dir = new Uint8Array(w * h);
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const i = y * w + x;
+    const gx = -b[i - w - 1] + b[i - w + 1] - 2 * b[i - 1] + 2 * b[i + 1] - b[i + w - 1] + b[i + w + 1];
+    const gy = -b[i - w - 1] - 2 * b[i - w] - b[i - w + 1] + b[i + w - 1] + 2 * b[i + w] + b[i + w + 1];
+    mag[i] = Math.hypot(gx, gy);
+    let a = Math.atan2(gy, gx) * 180 / Math.PI; if (a < 0) a += 180;
+    dir[i] = (a < 22.5 || a >= 157.5) ? 0 : a < 67.5 ? 1 : a < 112.5 ? 2 : 3;
+  }
+  const nms = new Float32Array(w * h), vals = [];
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const i = y * w + x, m = mag[i]; if (m < 1e-3) continue;
+    let p, q;
+    switch (dir[i]) {
+      case 0: p = mag[i - 1]; q = mag[i + 1]; break;
+      case 1: p = mag[i - w - 1]; q = mag[i + w + 1]; break;
+      case 2: p = mag[i - w]; q = mag[i + w]; break;
+      default: p = mag[i - w + 1]; q = mag[i + w - 1];
+    }
+    if (m >= p && m >= q) { nms[i] = m; vals.push(m); }
+  }
+  if (!vals.length) return new Uint8Array(w * h);
+  const sorted = Float32Array.from(vals).sort();
+  const keep = 0.03 + 0.22 * detail / 100;
+  const hi = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * (1 - keep)))], lo = hi * 0.45;
+  const edge = new Uint8Array(w * h), st = [];
+  for (let i = 0; i < nms.length; i++) if (nms[i] >= hi) { edge[i] = 1; st.push(i); }
+  while (st.length) {
+    const i = st.pop(), x = i % w, y = (i / w) | 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const X = x + dx, Y = y + dy; if (X < 0 || Y < 0 || X >= w || Y >= h) continue;
+      const j = Y * w + X; if (!edge[j] && nms[j] >= lo) { edge[j] = 1; st.push(j); }
+    }
+  }
+  return edge;
+}
+
+/* ---------- 외곽선을 이어진 선(체인)으로 ---------- */
+const NB = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, 1], [1, -1], [-1, -1]];
+function trace(edge, w, h, minLen) {
+  const vis = new Uint8Array(w * h), chains = [];
+  const deg = i => { const x = i % w, y = (i / w) | 0; let n = 0;
+    for (const [dx, dy] of NB) { const X = x + dx, Y = y + dy; if (X >= 0 && Y >= 0 && X < w && Y < h && edge[Y * w + X]) n++; } return n; };
+  const walk = s => {
+    const pts = []; let i = s;
+    while (i >= 0) {
+      vis[i] = 1; const x = i % w, y = (i / w) | 0; pts.push(x, y); let nx = -1;
+      for (const [dx, dy] of NB) { const X = x + dx, Y = y + dy; if (X < 0 || Y < 0 || X >= w || Y >= h) continue;
+        const j = Y * w + X; if (edge[j] && !vis[j]) { nx = j; break; } }
+      i = nx;
+    }
+    if (pts.length / 2 >= minLen) chains.push(pts);
+  };
+  for (let i = 0; i < edge.length; i++) if (edge[i] && !vis[i] && deg(i) === 1) walk(i);
+  for (let i = 0; i < edge.length; i++) if (edge[i] && !vis[i]) walk(i);
+  chains.sort((a, b) => b.length - a.length);
+  return chains;
+}
+
+/* ---------- 이미지 → 스케치 데이터 ---------- */
+function loadImg(file) {
+  return new Promise((res, rej) => {
+    const u = URL.createObjectURL(file), im = new Image();
+    im.onload = () => res(im); im.onerror = () => rej(new Error(file.name)); im.src = u;
+  });
+}
+function build(img, detail) {
+  const s = Math.min(1, MAXP / Math.max(img.naturalWidth, img.naturalHeight));
+  const W = even(img.naturalWidth * s), H = even(img.naturalHeight * s);
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const x = c.getContext('2d', { willReadFrequently: true }); x.drawImage(img, 0, 0, W, H);
+  const d = x.getImageData(0, 0, W, H).data, g = new Float32Array(W * H);
+  for (let i = 0; i < g.length; i++) g[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+  const chains = trace(canny(g, W, H, detail), W, H, 10);
+  let total = 0; for (const c2 of chains) total += c2.length / 2 - 1;
+  return { img, W, H, chains, total };
+}
+
+/* ---------- 렌더러 ---------- */
+class Renderer {
+  constructor(item, outW) {
+    this.it = item; this.s = outW / item.W; this.w = even(outW); this.h = even(item.H * this.s);
+    this.chains = item.chains; this.total = item.total;
+    this.lw = Math.max(1.4, this.w / 360);
+    this.bg = this.makeBg();
+    this.base = document.createElement('canvas'); this.base.width = this.w; this.base.height = this.h;
+    this.x = this.base.getContext('2d');
+    this.out = document.createElement('canvas'); this.out.width = this.w; this.out.height = this.h;
+    this.ox = this.out.getContext('2d', { willReadFrequently: true });
+    this.reset();
+  }
+  makeBg() { // 아주 작게 줄였다가 단계적으로 키워서 강하게 블러 (ctx.filter 미지원 브라우저 대응)
+    const { w, h } = this, mk = (cw, ch) => { const c = document.createElement('canvas'); c.width = Math.max(4, cw | 0); c.height = Math.max(4, ch | 0); return c; };
+    let cur = mk(w / 40, h / 40); const q = cur.getContext('2d'); q.imageSmoothingQuality = 'high'; q.drawImage(this.it.img, 0, 0, cur.width, cur.height);
+    for (const f of [14, 5, 1]) { const n = mk(w / f, h / f), nx = n.getContext('2d'); nx.imageSmoothingQuality = 'high'; nx.drawImage(cur, 0, 0, n.width, n.height); cur = n; }
+    const c = mk(w, h); c.width = w; c.height = h; const x = c.getContext('2d');
+    x.drawImage(cur, 0, 0, w, h); x.fillStyle = 'rgba(4,4,14,.55)'; x.fillRect(0, 0, w, h);
+    return c;
+  }
+  reset() { this.x.globalCompositeOperation = 'source-over'; this.x.drawImage(this.bg, 0, 0); this.ci = 0; this.pi = 0; this.drawn = 0; this.tip = null; }
+  run(c, a, b, hue) {
+    const x = this.x, s = this.s;
+    x.beginPath(); x.moveTo(c[2 * a] * s, c[2 * a + 1] * s);
+    for (let i = a + 1; i <= b; i++) x.lineTo(c[2 * i] * s, c[2 * i + 1] * s);
+    x.lineCap = x.lineJoin = 'round';
+    x.globalCompositeOperation = 'lighter'; x.strokeStyle = `hsla(${hue},100%,55%,.35)`; x.lineWidth = this.lw * 3.4; x.stroke();
+    x.globalCompositeOperation = 'source-over'; x.strokeStyle = `hsl(${hue},100%,78%)`; x.lineWidth = this.lw; x.stroke();
+  }
+  advance(n) {
+    while (this.drawn < n && this.ci < this.chains.length) {
+      const c = this.chains[this.ci], len = c.length / 2;
+      if (this.pi >= len - 1) { this.ci++; this.pi = 0; continue; }
+      const a = this.pi, b = Math.min(len - 1, a + Math.min(30, n - this.drawn));
+      this.run(c, a, b, (this.ci * 137.5 + a * 0.8) % 360);
+      this.drawn += b - a; this.pi = b; this.tip = [c[2 * b] * this.s, c[2 * b + 1] * this.s];
+    }
+  }
+  frame(n, tip) {
+    this.advance(n); const o = this.ox; o.globalCompositeOperation = 'source-over'; o.drawImage(this.base, 0, 0);
+    if (tip && this.tip && this.drawn < this.total) {
+      const [px, py] = this.tip, r = this.lw * 6, g = o.createRadialGradient(px, py, 0, px, py, r);
+      g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(.3, 'rgba(255,255,255,.6)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+      o.globalCompositeOperation = 'lighter'; o.fillStyle = g; o.beginPath(); o.arc(px, py, r, 0, 7); o.fill();
+    }
+  }
+}
+
+/* ---------- 재생 / 저장 ---------- */
+const MIMES = ['video/mp4;codecs=avc1.42E01E', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+const mime = window.MediaRecorder ? MIMES.find(m => MediaRecorder.isTypeSupported(m)) : null;
+const ext = mime && mime.startsWith('video/mp4') ? 'mp4' : 'webm';
+const dur = () => +$('#dur').value;
+
+function play(card) {
+  return new Promise(res => {
+    const r = card.r, D = card.dur, tk = card.token = Symbol(); r.reset();
+    const t0 = performance.now();
+    (function step(now) {
+      if (card.token !== tk) return res(false);
+      const t = (now - t0) / 1000;
+      r.frame(Math.floor(r.total * Math.min(1, t / D)), true);
+      if (t < D + HOLD) requestAnimationFrame(step); else res(true);
+    })(t0);
+  });
+}
+function download(blob, name) {
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+async function busy(btns, fn) {
+  btns.forEach(b => b.disabled = true);
+  try { await fn(); } catch (e) { alert('저장에 실패했어요: ' + e.message); }
+  btns.forEach(b => b.disabled = false);
+}
+async function saveVideo(card, btn, all) {
+  if (!mime) return alert('이 브라우저는 영상 녹화를 지원하지 않아요. GIF로 저장해 보세요.');
+  const label = btn.textContent;
+  await busy(all, async () => {
+    btn.textContent = '녹화 중…';
+    const rec = new MediaRecorder(card.r.out.captureStream(30), { mimeType: mime, videoBitsPerSecond: 8e6 }), chunks = [];
+    rec.ondataavailable = e => e.data.size && chunks.push(e.data);
+    const stopped = new Promise(r => rec.onstop = r);
+    rec.start(); await play(card); await sleep(200); rec.stop(); await stopped;
+    download(new Blob(chunks, { type: mime.split(';')[0] }), `neon-sketch-${card.n}.${ext}`);
+  });
+  btn.textContent = label;
+}
+async function saveGif(card, btn, all) {
+  const label = btn.textContent;
+  await busy(all, async () => {
+    btn.textContent = 'GIF 준비 중…';
+    const { GIFEncoder, quantize, applyPalette } = await import('https://cdn.jsdelivr.net/npm/gifenc@1.0.3/+esm');
+    const r = new Renderer(card.item, Math.min(480, card.item.W)), fps = 15, D = card.dur, N = Math.round((D + HOLD) * fps);
+    r.frame(r.total, false);
+    const palette = quantize(r.ox.getImageData(0, 0, r.w, r.h).data, 256);
+    r.reset();
+    const gif = GIFEncoder();
+    for (let i = 0; i <= N; i++) {
+      r.frame(Math.floor(r.total * Math.min(1, i / fps / D)), true);
+      const idx = applyPalette(r.ox.getImageData(0, 0, r.w, r.h).data, palette);
+      gif.writeFrame(idx, r.w, r.h, i === 0 ? { palette, delay: Math.round(1000 / fps), repeat: 0 } : { delay: Math.round(1000 / fps) });
+      if (i % 3 === 0) { btn.textContent = `GIF 만드는 중 ${Math.round(i / N * 100)}%`; await sleep(0); }
+    }
+    gif.finish(); download(new Blob([gif.bytes()], { type: 'image/gif' }), `neon-sketch-${card.n}.gif`);
+  });
+  btn.textContent = label;
+}
+
+/* ---------- UI ---------- */
+function addCard(item, n) {
+  const card = { item, n, dur: dur(), r: new Renderer(item, item.W) };
+  card.r.frame(card.r.total, false);
+  const el = document.createElement('div'); el.className = 'card'; el.appendChild(card.r.out);
+  const row = document.createElement('div'); row.className = 'row';
+  const mk = (t, cls) => { const b = document.createElement('button'); b.textContent = t; if (cls) b.className = cls; row.appendChild(b); return b; };
+  const bp = mk('▶ 다시 보기', 'ghost'), bv = mk(`영상 저장 (${ext.toUpperCase()})`), bg = mk('GIF 저장');
+  const all = [bp, bv, bg];
+  bp.onclick = () => play(card);
+  bv.onclick = () => saveVideo(card, bv, all);
+  bg.onclick = () => saveGif(card, bg, all);
+  el.appendChild(row); $('#results').appendChild(el);
+}
+
+$('#detail').oninput = e => $('#detailO').textContent = e.target.value;
+$('#dur').oninput = e => $('#durO').textContent = e.target.value + '초';
+const input = $('#files'), dz = $('#dz');
+const label = () => $('#fileLabel').textContent = input.files.length ? `${input.files.length}장 선택됨` : '이미지를 선택하거나 여기로 끌어다 놓기 (여러 장 가능)';
+input.onchange = label;
+dz.ondragover = e => { e.preventDefault(); dz.classList.add('on'); };
+dz.ondragleave = () => dz.classList.remove('on');
+dz.ondrop = e => { e.preventDefault(); dz.classList.remove('on'); input.files = e.dataTransfer.files; label(); };
+
+$('#go').onclick = async e => {
+  const files = [...input.files].filter(f => f.type.startsWith('image/'));
+  if (!files.length) { $('#status').textContent = '먼저 이미지를 선택해 주세요.'; return; }
+  e.target.disabled = true; $('#results').innerHTML = '';
+  for (let i = 0; i < files.length; i++) {
+    $('#status').textContent = `외곽선 추출 중… (${i + 1}/${files.length})`; await sleep(30);
+    try {
+      const item = build(await loadImg(files[i]), +$('#detail').value);
+      if (!item.total) { $('#status').textContent = `${files[i].name}: 외곽선을 찾지 못했어요. 디테일을 높여 보세요.`; continue; }
+      addCard(item, i + 1);
+    } catch (err) { $('#status').textContent = `${err.message} 파일을 열 수 없어요.`; }
+  }
+  if ($('#results').children.length) $('#status').textContent = '완료! ▶로 미리 보고 저장하세요.';
+  e.target.disabled = false;
+};
+</script>
+</body>
+</html>
